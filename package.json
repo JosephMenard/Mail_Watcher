@@ -1,0 +1,17 @@
+{
+  "name": "sentinel-ingest",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node ingest.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.44.0",
+    "better-sqlite3": "^9.6.0",
+    "dotenv": "^16.6.1",
+    "html-to-text": "^9.0.5",
+    "imapflow": "^1.0.162",
+    "mailparser": "^3.7.1",
+    "sqlite-vec": "^0.1.7-alpha.2"
+  }
+}

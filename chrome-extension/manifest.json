@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Sentinel Gmail Bridge",
+  "version": "1.0",
+  "description": "Détecte les emails ouverts dans Gmail et interroge la base locale.",
+  "content_scripts": [
+    {
+      "matches": ["https://mail.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "http://localhost:3000/"
+  ]
+}
