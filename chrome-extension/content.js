@@ -1,3 +1,36 @@
+async function ensureServiceWorkerAlive() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "KEEPALIVE" }, (response) => {
+      if (chrome.runtime.lastError) { setTimeout(resolve, 200); }
+      else { resolve(); }
+    });
+  });
+}
+
+async function fetchViaBackground(url, options = {}) {
+  await ensureServiceWorkerAlive();
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { type: "FETCH_PROXY", url, options },
+      (response) => {
+        if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
+        if (response.success) resolve(response.data);
+        else reject(new Error(response.error));
+      }
+    );
+  });
+}
+
+function extractFromDOM(selectors, attr = null) {
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (!el) continue;
+    if (attr) { const v = el.getAttribute(attr); if (v) return v; }
+    else if (el.textContent?.trim()) return el.textContent.trim();
+  }
+  return "";
+}
+
 let hasBeenSent = false;
 let lastSubject = null;
 
@@ -7,18 +40,18 @@ const STYLE_ID      = 'sentinel-styles';
 // ─── DOM helpers ──────────────────────────────────────────────────────────────
 
 function extractEmailData() {
-  const subjectEl = document.querySelector('h2.hP');
-  const senderEl  = document.querySelector('span.gD[email]');
-  if (!subjectEl || !senderEl) return null;
-  return {
-    subject: subjectEl.textContent.trim(),
-    sender:  senderEl.getAttribute('email').trim(),
-  };
+  const subject = extractFromDOM(['h2.hP', '.ha h2', '[data-legacy-thread-id] h2', '.nH .ii h2']);
+  const sender  = extractFromDOM(['.gD[email]', 'span[email]', '[data-hovercard-id]'], 'email')
+               || extractFromDOM(['.gD', '.go span']);
+  if (!subject || !sender) return null;
+  return { subject, sender };
 }
 
-/** Insère le banner juste avant le <h2.hP> (sujet) dans son parent direct. */
+/** Insère le banner juste avant le sujet dans son parent direct. */
 function getInsertionAnchor() {
-  return document.querySelector('h2.hP');
+  return document.querySelector('h2.hP')
+      || document.querySelector('.ha h2')
+      || document.querySelector('.nH .ii h2');
 }
 
 function injectStyles() {
@@ -225,12 +258,11 @@ function showErrorBanner() {
 async function trigger(data) {
   showLoadingBanner();
   try {
-    const res  = await fetch('http://localhost:3000/trigger', {
+    const json = await fetchViaBackground('http://localhost:3000/trigger', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(data),
     });
-    const json = await res.json();
     if (json?.analysis) {
       showResultBanner(json);
     } else {

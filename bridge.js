@@ -1,14 +1,45 @@
 import 'dotenv/config';
 import http from 'http';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { GoogleGenAI } from '@google/genai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database(path.join(__dirname, 'database.db'), { readonly: true });
+const DB_PATH = process.env.DB_PATH ?? path.join(__dirname, 'database.db');
+const MAX_BODY_CHARS = parseInt(process.env.MAX_BODY_CHARS ?? '2000', 10);
+
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
+
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+
+// ─── Schema ───────────────────────────────────────────────────────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sender_history (
+    email TEXT PRIMARY KEY COLLATE NOCASE,
+    total_score REAL NOT NULL DEFAULT 0,
+    count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    last_seen_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+
+  CREATE TABLE IF NOT EXISTS analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email_hash TEXT NOT NULL UNIQUE,
+    sender TEXT NOT NULL,
+    subject TEXT,
+    raw_score REAL,
+    trust_score REAL,
+    verdict TEXT,
+    explanation TEXT,
+    analyzed_at INTEGER NOT NULL DEFAULT (unixepoch())
+  );
+`);
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -45,12 +76,67 @@ function riskEmoji(score) {
   return '🔴';
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function normalizeEmail(raw) {
+  if (!raw) return '';
+  const match = raw.match(/<([^>]+)>/);
+  const address = match ? match[1] : raw;
+  return address.trim().toLowerCase();
+}
+
+function hashEmail(sender, subject, body) {
+  return crypto.createHash('sha256')
+    .update(sender + '|' + subject + '|' + (body || '').slice(0, MAX_BODY_CHARS))
+    .digest('hex');
+}
+
+function formatTs(unixSec) {
+  if (!unixSec) return 'Inconnue';
+  return new Date(unixSec * 1000).toLocaleString('fr-FR', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// ─── Trust Score ──────────────────────────────────────────────────────────────
+
+function computeTrustScore(email, rawScore, history) {
+  const FIRST_CONTACT_MALUS = 0.10;
+  let finalScore = rawScore;
+  if (!history || history.count === 0) {
+    finalScore = Math.min(1.0, rawScore + FIRST_CONTACT_MALUS);
+  } else {
+    const mean = history.total_score / history.count;
+    const delta = (mean - rawScore) * 0.5;
+    finalScore = rawScore + delta;
+  }
+  return Math.max(0.0, Math.min(1.0, finalScore));
+}
+
+function updateSenderHistory(db, email, rawScore) {
+  const normalized = email.toLowerCase().trim();
+  const existing = db.prepare('SELECT * FROM sender_history WHERE email = ?').get(normalized);
+  if (existing) {
+    db.prepare('UPDATE sender_history SET total_score = total_score + ?, count = count + 1, last_seen_at = unixepoch() WHERE email = ?')
+      .run(rawScore, normalized);
+  } else {
+    db.prepare('INSERT INTO sender_history (email, total_score, count) VALUES (?, ?, 1)')
+      .run(normalized, rawScore);
+  }
+}
+
 // ─── Statements ───────────────────────────────────────────────────────────────
 
 const findEmail = db.prepare(
   `SELECT id, sender, subject, clean_body, received_at
    FROM emails
-   WHERE sender LIKE ? AND subject = ?
+   WHERE LOWER(TRIM(
+     CASE WHEN INSTR(sender, '<') > 0
+       THEN REPLACE(SUBSTR(sender, INSTR(sender, '<') + 1), '>', '')
+       ELSE sender
+     END
+   )) = ? AND subject = ?
    ORDER BY received_at DESC LIMIT 1`
 );
 
@@ -70,20 +156,16 @@ const findKnn = db.prepare(
    LIMIT 3`
 );
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const findAnalysisCache = db.prepare(
+  'SELECT * FROM analyses WHERE email_hash = ?'
+);
 
-function formatTs(unixSec) {
-  if (!unixSec) return 'Inconnue';
-  return new Date(unixSec * 1000).toLocaleString('fr-FR', {
-    day: '2-digit', month: '2-digit', year: 'numeric',
-    hour: '2-digit', minute: '2-digit',
-  });
-}
+const saveAnalysis = db.prepare(
+  `INSERT OR REPLACE INTO analyses (email_hash, sender, subject, raw_score, trust_score, verdict, explanation)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`
+);
 
-function extractAddress(sender) {
-  const match = sender.match(/<([^>]+)>/);
-  return (match ? match[1] : sender).trim().toLowerCase();
-}
+// ─── Display ──────────────────────────────────────────────────────────────────
 
 function buildPrompt({ email, profile, knn }) {
   const firstContact = profile?.first_contact_date
@@ -118,13 +200,11 @@ ${historique}
 Date : ${formatTs(email.received_at)}
 Sujet : ${email.subject}
 Contenu :
-${email.clean_body}
+${(email.clean_body ?? '').slice(0, MAX_BODY_CHARS)}
 </EMAIL_CIBLE>
 
 Analyse cet email cible. Le comportement est-il cohérent avec l'historique ? Renvoie ton analyse au format JSON strict : {"score_risque_sur_100": int, "type_menace": "string", "explication": "string"}.`;
 }
-
-// ─── Display ──────────────────────────────────────────────────────────────────
 
 function logPrompt(email, prompt) {
   const ts = new Date().toLocaleTimeString('fr-FR');
@@ -137,7 +217,6 @@ function logPrompt(email, prompt) {
   console.log(SEP);
   console.log(`  ${C.bold}${C.dim}PROMPT ENVOYÉ À GEMINI${C.reset}`);
   console.log(SEP);
-  // Indente chaque ligne du prompt pour la lisibilité
   prompt.split('\n').forEach(line => console.log(`  ${C.dim}${line}${C.reset}`));
   console.log(SEP2);
 }
@@ -153,7 +232,6 @@ function logGeminiResponse(result) {
   console.log(`  ${C.bold}Score de risque${C.reset}  :  ${color}${C.bold}${score} / 100${C.reset}  ${emoji}`);
   console.log(`  ${C.bold}Type de menace ${C.reset}  :  ${result.type_menace ?? '—'}`);
   console.log(`  ${C.bold}Explication    ${C.reset}  :`);
-  // Wrap l'explication sur 70 chars
   const expl = result.explication ?? '—';
   const words = expl.split(' ');
   let line = '    ';
@@ -176,27 +254,33 @@ function logError(context, err) {
   console.error(SEP);
 }
 
-// ─── Gemini call ──────────────────────────────────────────────────────────────
+// ─── Gemini call with retry ────────────────────────────────────────────────────
 
-async function analyzeWithGemini(prompt) {
-  const response = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
-    contents: prompt,
-  });
-
-  let text = response.text.replace(/```json|```/g, '').trim();
-  return JSON.parse(text);
+async function callGeminiWithRetry(prompt, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const result = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
+      return result.text;
+    } catch (err) {
+      const retryable = err.status === 429 || err.status === 503 || err.status === 500;
+      if (retryable && attempt < maxRetries - 1) {
+        const waitMs = Math.pow(2, attempt) * 1500;
+        console.warn('[bridge] Gemini error ' + err.status + ', retry in ' + waitMs + 'ms');
+        await new Promise(r => setTimeout(r, waitMs));
+      } else throw err;
+    }
+  }
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
 function handleTrigger(req, res) {
-  let body = '';
-  req.on('data', chunk => { body += chunk; });
+  let rawBody = '';
+  req.on('data', chunk => { rawBody += chunk; });
   req.on('end', async () => {
     let payload;
     try {
-      payload = JSON.parse(body);
+      payload = JSON.parse(rawBody);
     } catch {
       res.writeHead(400, CORS_HEADERS);
       return res.end(JSON.stringify({ error: 'Invalid JSON' }));
@@ -208,23 +292,47 @@ function handleTrigger(req, res) {
       return res.end(JSON.stringify({ error: 'Missing sender or subject' }));
     }
 
-    const email = findEmail.get(`%${sender}%`, subject);
+    const normalizedSender = normalizeEmail(sender);
+    const email = findEmail.get(normalizedSender, subject);
     if (!email) {
-      console.log(`[Sentinel] Aucun match — sender: ${sender} | subject: ${subject}`);
+      console.log(`[bridge] Aucun match — sender: ${sender} | subject: ${subject}`);
       res.writeHead(200, CORS_HEADERS);
       return res.end(JSON.stringify({ found: false }));
     }
 
     try {
-      const senderAddr = extractAddress(email.sender);
-      const profile    = findProfile.get(senderAddr);
-      const knn        = findKnn.all(email.id, email.id);
-      const prompt     = buildPrompt({ email, profile, knn });
+      // Cache check
+      const emailHash = hashEmail(normalizedSender, email.subject, email.clean_body);
+      const cached = findAnalysisCache.get(emailHash);
+      if (cached) {
+        console.log('[bridge] Cache hit — skip Gemini');
+        res.writeHead(200, CORS_HEADERS);
+        return res.end(JSON.stringify({ found: true, cached: true, analysis: cached }));
+      }
+
+      const profile = findProfile.get(normalizedSender);
+      const knn     = findKnn.all(email.id, email.id);
+      const prompt  = buildPrompt({ email, profile, knn });
 
       logPrompt(email, prompt);
 
-      const result = await analyzeWithGemini(prompt);
+      const rawText = await callGeminiWithRetry(prompt);
+      const cleanText = rawText.replace(/```json|```/g, '').trim();
+      const result = JSON.parse(cleanText);
+
       logGeminiResponse(result);
+
+      const rawScore = (result.score_risque_sur_100 ?? 50) / 100;
+      const senderHistory = db.prepare('SELECT * FROM sender_history WHERE email = ?').get(normalizedSender);
+      const trustScore = computeTrustScore(normalizedSender, rawScore, senderHistory);
+      updateSenderHistory(db, normalizedSender, rawScore);
+
+      const verdict = result.type_menace ?? '';
+      const explanation = result.explication ?? '';
+
+      saveAnalysis.run(emailHash, email.sender, email.subject, rawScore, trustScore, verdict, explanation);
+
+      console.log(`[trust] ${normalizedSender} — raw: ${(rawScore * 100).toFixed(0)}/100 → trust: ${(trustScore * 100).toFixed(0)}/100`);
 
       res.writeHead(200, CORS_HEADERS);
       res.end(JSON.stringify({
@@ -233,7 +341,7 @@ function handleTrigger(req, res) {
         sender:   email.sender,
         subject:  email.subject,
         profile: {
-          interaction_count: profile?.interaction_count ?? 0,
+          interaction_count:  profile?.interaction_count  ?? 0,
           first_contact_date: profile?.first_contact_date ?? null,
         },
         similar: knn.map(r => ({
@@ -241,7 +349,10 @@ function handleTrigger(req, res) {
           received_at: r.received_at,
           distance:    r.distance,
         })),
-        analysis: result,
+        analysis: {
+          ...result,
+          trust_score: Math.round(trustScore * 100),
+        },
       }));
     } catch (err) {
       logError('GraphRAG / Gemini', err);
@@ -252,6 +363,8 @@ function handleTrigger(req, res) {
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
+
+const PORT = parseInt(process.env.BRIDGE_PORT ?? '3000', 10);
 
 const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') {
@@ -267,9 +380,9 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(3000, () => {
+server.listen(PORT, () => {
   console.log(`\n${SEP2}`);
-  console.log(`  🛡️  ${C.green}${C.bold}Sentinel Bridge démarré${C.reset}  →  port ${C.cyan}3000${C.reset}`);
-  console.log(`  ${C.dim}GraphRAG + Gemini 2.5 Flash activés${C.reset}`);
+  console.log(`  🛡️  ${C.green}${C.bold}Sentinel Bridge démarré${C.reset}  →  port ${C.cyan}${PORT}${C.reset}`);
+  console.log(`  ${C.dim}GraphRAG + Gemini 2.5 Flash — trust score AWL — analyses cache${C.reset}`);
   console.log(SEP2 + '\n');
 });

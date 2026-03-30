@@ -1,16 +1,22 @@
 {
   "manifest_version": 3,
-  "name": "Sentinel Gmail Bridge",
-  "version": "1.0",
-  "description": "Détecte les emails ouverts dans Gmail et interroge la base locale.",
+  "name": "Mail Watcher — Sentinel",
+  "version": "1.0.0",
+  "description": "Détection de phishing email en temps réel via Gemini AI",
+  "permissions": ["activeTab", "storage"],
+  "host_permissions": [
+    "https://mail.google.com/*",
+    "http://localhost:3000/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
   "content_scripts": [
     {
       "matches": ["https://mail.google.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
-  ],
-  "host_permissions": [
-    "http://localhost:3000/"
   ]
 }

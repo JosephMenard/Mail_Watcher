@@ -1,3 +1,11 @@
 database.db
 database.db-shm
 database.db-wal
+*.db
+*.db-shm
+*.db-wal
+.gitnexus
+node_modules/
+.env
+*.env.local
+.DS_Store

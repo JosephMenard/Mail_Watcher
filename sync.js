@@ -1,7 +1,7 @@
 /**
- * sync.js — Synchronisation incrémentale : IMAP → Profils SQL → Vecteurs Ollama
+ * sync.js — Synchronisation incrémentale : IMAP → Profils SQL → Vecteurs Gemini
  *
- * Dépendances : imapflow, better-sqlite3, sqlite-vec, html-to-text, mailparser, dotenv
+ * Dépendances : imapflow, better-sqlite3, sqlite-vec, html-to-text, mailparser, dotenv, @google/genai
  * Usage       : node sync.js
  */
 
@@ -11,21 +11,27 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { convert } from 'html-to-text';
 import { simpleParser } from 'mailparser';
+import { GoogleGenAI } from '@google/genai';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const DB_PATH        = './database.db';
+const DB_PATH        = process.env.DB_PATH ?? './database.db';
 const IMAP_BATCH     = 500;
 const VEC_BATCH      = 100;
 const VEC_LOG_EVERY  = 100;
-const MAX_BODY_CHARS = 500; // ~150-200 tokens — conservateur pour nomic-embed-text
-const OLLAMA_URL     = 'http://localhost:11434/api/embed';
-const OLLAMA_MODEL   = 'nomic-embed-text';
+const MAX_BODY_CHARS = parseInt(process.env.MAX_BODY_CHARS ?? '2000', 10);
 
 if (!process.env.EMAIL || !process.env.APP_PASSWORD) {
   console.error('[FATAL] EMAIL et APP_PASSWORD doivent être définis dans le fichier .env');
   process.exit(1);
 }
+
+if (!process.env.GEMINI_API_KEY) {
+  console.error('[FATAL] GEMINI_API_KEY doit être défini dans le fichier .env');
+  process.exit(1);
+}
+
+const genai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // ─── Database ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +61,30 @@ db.exec(`
 
   CREATE VIRTUAL TABLE IF NOT EXISTS vec_emails USING vec0(embedding float[768]);
 `);
+
+// ─── Embedding ────────────────────────────────────────────────────────────────
+
+async function getEmbedding(text) {
+  const response = await genai.models.embedContent({
+    model: 'text-embedding-004',
+    contents: text,
+  });
+  return response.embeddings[0].values; // 768 dims — identique à nomic-embed-text
+}
+
+async function getEmbeddingWithRetry(text, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await getEmbedding(text);
+    } catch (err) {
+      if ((err.status === 429 || err.status === 503) && attempt < maxRetries - 1) {
+        const waitMs = Math.pow(2, attempt) * 1000;
+        console.warn('[sync] Rate limit embedding, retry dans ' + waitMs + 'ms');
+        await new Promise(r => setTimeout(r, waitMs));
+      } else throw err;
+    }
+  }
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -286,26 +316,10 @@ async function vectorizeNew() {
           `Date d'envoi: ${new Date(email.received_at * 1000).toISOString()}\n` +
           `Contenu: ${safeBody}`;
 
-        const res = await fetch(OLLAMA_URL, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({
-            model:    OLLAMA_MODEL,
-            input,
-            truncate: true,
-            options:  { num_ctx: 8192 },
-          }),
-        });
-
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status} — ${await res.text()}`);
-        }
-
-        const data      = await res.json();
-        const embedding = data.embeddings?.[0];
+        const embedding = await getEmbeddingWithRetry(input);
 
         if (!Array.isArray(embedding) || embedding.length === 0) {
-          throw new Error('Réponse Ollama invalide : embeddings[0] absent ou vide');
+          throw new Error('Réponse Gemini invalide : embeddings[0] absent ou vide');
         }
 
         const floatArray = new Float32Array(embedding);
