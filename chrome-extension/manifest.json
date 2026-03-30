@@ -6,7 +6,7 @@
   "permissions": ["activeTab", "storage"],
   "host_permissions": [
     "https://mail.google.com/*",
-    "http://localhost:3000/*"
+    "https://vps-ad27ed87.tail1b7e7d.ts.net:8443/*"
   ],
   "background": {
     "service_worker": "background.js",

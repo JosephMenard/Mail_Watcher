@@ -258,7 +258,7 @@ function showErrorBanner() {
 async function trigger(data) {
   showLoadingBanner();
   try {
-    const json = await fetchViaBackground('http://localhost:3000/trigger', {
+    const json = await fetchViaBackground('https://vps-ad27ed87.tail1b7e7d.ts.net:8443/trigger', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(data),
