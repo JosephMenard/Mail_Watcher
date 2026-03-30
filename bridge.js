@@ -5,7 +5,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
-import { GoogleGenAI } from '@google/genai';
+import OpenAI from 'openai';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.DB_PATH ?? path.join(__dirname, 'database.db');
@@ -41,7 +41,10 @@ db.exec(`
   );
 `);
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const deepinfra = new OpenAI({
+  apiKey: process.env.DEEPINFRA,
+  baseURL: 'https://api.deepinfra.com/v1/openai',
+});
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': 'https://mail.google.com',
@@ -215,7 +218,7 @@ function logPrompt(email, prompt) {
   console.log(`  ${C.bold}Sujet      ${C.reset}  :  ${email.subject}`);
   console.log(`  ${C.bold}ID local   ${C.reset}  :  ${email.id}`);
   console.log(SEP);
-  console.log(`  ${C.bold}${C.dim}PROMPT ENVOYÉ À GEMINI${C.reset}`);
+  console.log(`  ${C.bold}${C.dim}PROMPT ENVOYÉ À DEEPINFRA (DeepSeek R1)${C.reset}`);
   console.log(SEP);
   prompt.split('\n').forEach(line => console.log(`  ${C.dim}${line}${C.reset}`));
   console.log(SEP2);
@@ -227,7 +230,7 @@ function logGeminiResponse(result) {
   const emoji  = typeof score === 'number' ? riskEmoji(score) : '❓';
 
   console.log(`\n${SEP}`);
-  console.log(`  🤖 ${C.magenta}${C.bold}RÉPONSE GEMINI${C.reset}`);
+  console.log(`  🤖 ${C.magenta}${C.bold}RÉPONSE DEEPINFRA (DeepSeek R1)${C.reset}`);
   console.log(SEP);
   console.log(`  ${C.bold}Score de risque${C.reset}  :  ${color}${C.bold}${score} / 100${C.reset}  ${emoji}`);
   console.log(`  ${C.bold}Type de menace ${C.reset}  :  ${result.type_menace ?? '—'}`);
@@ -254,18 +257,24 @@ function logError(context, err) {
   console.error(SEP);
 }
 
-// ─── Gemini call with retry ────────────────────────────────────────────────────
+// ─── DeepInfra call with retry ────────────────────────────────────────────────
 
 async function callGeminiWithRetry(prompt, maxRetries = 3) {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const result = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
-      return result.text;
+      const completion = await deepinfra.chat.completions.create({
+        model: 'deepseek-ai/DeepSeek-R1',
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const rawText = completion.choices[0].message.content ?? '';
+      // Strip <think>...</think> reasoning block from DeepSeek R1
+      return rawText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
     } catch (err) {
-      const retryable = err.status === 429 || err.status === 503 || err.status === 500;
+      const status = err.status ?? err.response?.status;
+      const retryable = status === 429 || status === 503 || status === 500;
       if (retryable && attempt < maxRetries - 1) {
         const waitMs = Math.pow(2, attempt) * 1500;
-        console.warn('[bridge] Gemini error ' + err.status + ', retry in ' + waitMs + 'ms');
+        console.warn('[bridge] DeepInfra error ' + status + ', retry in ' + waitMs + 'ms');
         await new Promise(r => setTimeout(r, waitMs));
       } else throw err;
     }
@@ -355,7 +364,7 @@ function handleTrigger(req, res) {
         },
       }));
     } catch (err) {
-      logError('GraphRAG / Gemini', err);
+      logError('GraphRAG / DeepInfra', err);
       res.writeHead(500, CORS_HEADERS);
       res.end(JSON.stringify({ error: 'Analysis failed' }));
     }
@@ -383,6 +392,6 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`\n${SEP2}`);
   console.log(`  🛡️  ${C.green}${C.bold}Sentinel Bridge démarré${C.reset}  →  port ${C.cyan}${PORT}${C.reset}`);
-  console.log(`  ${C.dim}GraphRAG + Gemini 2.5 Flash — trust score AWL — analyses cache${C.reset}`);
+  console.log(`  ${C.dim}GraphRAG + DeepInfra DeepSeek R1 — trust score AWL — analyses cache${C.reset}`);
   console.log(SEP2 + '\n');
 });

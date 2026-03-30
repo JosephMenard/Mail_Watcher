@@ -18,6 +18,7 @@
     "html-to-text": "^9.0.5",
     "imapflow": "^1.0.162",
     "mailparser": "^3.7.1",
+    "openai": "^6.33.0",
     "sqlite-vec": "^0.1.7-alpha.2"
   }
 }
