@@ -46,8 +46,9 @@ const deepinfra = new OpenAI({
   baseURL: 'https://api.deepinfra.com/v1/openai',
 });
 
+// Service Worker MV3 envoie sans origin ou avec chrome-extension:// → on accepte tout depuis le tailnet
 const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': 'https://mail.google.com',
+  'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Content-Type': 'application/json',
