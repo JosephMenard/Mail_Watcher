@@ -64,12 +64,39 @@ db.exec(`
 
 // ─── Embedding ────────────────────────────────────────────────────────────────
 
-async function getEmbedding(text) {
+const OLLAMA_URL   = process.env.OLLAMA_URL ?? 'http://localhost:11434';
+const OLLAMA_MODEL = process.env.OLLAMA_EMBED_MODEL ?? 'nomic-embed-text';
+
+async function getEmbeddingGemini(text) {
   const response = await genai.models.embedContent({
-    model: 'text-embedding-004',
+    model: 'gemini-embedding-001',
     contents: text,
+    config: { outputDimensionality: 768 },
   });
-  return response.embeddings[0].values; // 768 dims — identique à nomic-embed-text
+  return response.embeddings[0].values; // 768 dims
+}
+
+async function getEmbeddingOllama(text) {
+  const res = await fetch(`${OLLAMA_URL}/api/embeddings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: OLLAMA_MODEL, prompt: text }),
+  });
+  if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
+  const json = await res.json();
+  if (!Array.isArray(json.embedding) || json.embedding.length !== 768) {
+    throw new Error(`Ollama: embedding invalide (dims=${json.embedding?.length})`);
+  }
+  return json.embedding;
+}
+
+async function getEmbedding(text) {
+  try {
+    return await getEmbeddingGemini(text);
+  } catch (geminiErr) {
+    console.warn(`[embed] Gemini échoué (${geminiErr.message}), fallback Ollama…`);
+    return await getEmbeddingOllama(text);
+  }
 }
 
 async function getEmbeddingWithRetry(text, maxRetries = 3) {
